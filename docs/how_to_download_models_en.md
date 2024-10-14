@@ -1,60 +1,27 @@
-### Install Git LFS
-Before you begin, make sure Git Large File Storage (Git LFS) is installed on your system. Install it using the following command:
+Model downloads are divided into initial downloads and updates to the model directory. Please refer to the corresponding documentation for instructions on how to proceed.
 
+
+# Initial download of model files
+
+### 1. Download the Model from Hugging Face
+Use a Python Script to Download Model Files from Hugging Face
 ```bash
-git lfs install
+pip install huggingface_hub
+wget https://github.com/opendatalab/MinerU/raw/master/docs/download_models_hf.py -O download_models_hf.py
+python download_models_hf.py
 ```
+The Python script will automatically download the model files and configure the model directory in the configuration file.
 
-### Download the Model from Hugging Face
-To download the `PDF-Extract-Kit` model from Hugging Face, use the following command:
+The configuration file can be found in the user directory, with the filename `magic-pdf.json`.
 
-```bash
-git lfs clone https://huggingface.co/wanderkid/PDF-Extract-Kit
-```
+# How to update models previously downloaded
 
-Ensure that Git LFS is enabled during the clone to properly download all large files.
+## 1. Models downloaded via Git LFS
 
+>Due to feedback from some users that downloading model files using git lfs was incomplete or resulted in corrupted model files, this method is no longer recommended.
 
+If you previously downloaded model files via git lfs, you can navigate to the previous download directory and use the `git pull` command to update the model.
 
-### Download the Model from ModelScope
+## 2. Models downloaded via Hugging Face or Model Scope
 
-#### SDK Download
-
-```bash
-# First, install the ModelScope library using pip:
-pip install modelscope
-```
-
-```python
-# Use the following Python code to download the model using the ModelScope SDK:
-from modelscope import snapshot_download
-model_dir = snapshot_download('wanderkid/PDF-Extract-Kit')
-```
-
-#### Git Download
-Alternatively, you can use Git to clone the model repository from ModelScope:
-
-```bash
-git lfs clone https://www.modelscope.cn/wanderkid/PDF-Extract-Kit.git
-```
-
-
-Put [model files]() here:
-
-```
-./
-├── Layout
-│   ├── config.json
-│   └── model_final.pth
-├── MFD
-│   └── weights.pt
-├── MFR
-│   └── UniMERNet
-│       ├── config.json
-│       ├── preprocessor_config.json
-│       ├── pytorch_model.bin
-│       ├── README.md
-│       ├── tokenizer_config.json
-│       └── tokenizer.json
-└── README.md
-```
+If you previously downloaded models via Hugging Face or Model Scope, you can rerun the Python script used for the initial download. This will automatically update the model directory to the latest version.
