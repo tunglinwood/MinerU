@@ -1,19 +1,23 @@
-import json
+import enum
 
-from magic_pdf.libs.boxbase import (_is_in, _is_part_overlap, bbox_distance,
-                                    bbox_relative_pos, box_area, calculate_iou,
-                                    calculate_overlap_area_in_bbox1_area_ratio,
-                                    get_overlap_area)
-from magic_pdf.libs.commons import fitz, join_path
+from magic_pdf.config.model_block_type import ModelBlockTypeEnum
+from magic_pdf.config.ocr_content_type import CategoryId, ContentType
+from magic_pdf.data.dataset import Dataset
+from magic_pdf.libs.boxbase import (_is_in, bbox_distance, bbox_relative_pos,
+                                    calculate_iou)
 from magic_pdf.libs.coordinate_transform import get_scale_ratio
-from magic_pdf.libs.local_math import float_gt
-from magic_pdf.libs.ModelBlockTypeEnum import ModelBlockTypeEnum
-from magic_pdf.libs.ocr_content_type import CategoryId, ContentType
-from magic_pdf.rw.AbsReaderWriter import AbsReaderWriter
-from magic_pdf.rw.DiskReaderWriter import DiskReaderWriter
+from magic_pdf.pre_proc.remove_bbox_overlap import _remove_overlap_between_bbox
 
 CAPATION_OVERLAP_AREA_RATIO = 0.6
 MERGE_BOX_OVERLAP_AREA_RATIO = 1.1
+
+
+class PosRelationEnum(enum.Enum):
+    LEFT = 'left'
+    RIGHT = 'right'
+    UP = 'up'
+    BOTTOM = 'bottom'
+    ALL = 'all'
 
 
 class MagicModel:
@@ -24,7 +28,7 @@ class MagicModel:
             need_remove_list = []
             page_no = model_page_info['page_info']['page_no']
             horizontal_scale_ratio, vertical_scale_ratio = get_scale_ratio(
-                model_page_info, self.__docs[page_no]
+                model_page_info, self.__docs.get_page(page_no)
             )
             layout_dets = model_page_info['layout_dets']
             for layout_det in layout_dets:
@@ -99,7 +103,7 @@ class MagicModel:
             for need_remove in need_remove_list:
                 layout_dets.remove(need_remove)
 
-    def __init__(self, model_list: list, docs: fitz.Document):
+    def __init__(self, model_list: list, docs: Dataset):
         self.__model_list = model_list
         self.__docs = docs
         """为所有模型数据添加bbox信息(缩放，poly->bbox)"""
@@ -109,6 +113,24 @@ class MagicModel:
         """删除高iou(>0.9)数据中置信度较低的那个"""
         self.__fix_by_remove_high_iou_and_low_confidence()
         self.__fix_footnote()
+
+    def _bbox_distance(self, bbox1, bbox2):
+        left, right, bottom, top = bbox_relative_pos(bbox1, bbox2)
+        flags = [left, right, bottom, top]
+        count = sum([1 if v else 0 for v in flags])
+        if count > 1:
+            return float('inf')
+        if left or right:
+            l1 = bbox1[3] - bbox1[1]
+            l2 = bbox2[3] - bbox2[1]
+        else:
+            l1 = bbox1[2] - bbox1[0]
+            l2 = bbox2[2] - bbox2[0]
+
+        if l2 > l1 and (l2 - l1) / l1 > 0.3:
+            return float('inf')
+
+        return bbox_distance(bbox1, bbox2)
 
     def __fix_footnote(self):
         # 3: figure, 5: table, 7: footnote
@@ -144,7 +166,7 @@ class MagicModel:
                     if pos_flag_count > 1:
                         continue
                     dis_figure_footnote[i] = min(
-                        bbox_distance(figures[j]['bbox'], footnotes[i]['bbox']),
+                        self._bbox_distance(figures[j]['bbox'], footnotes[i]['bbox']),
                         dis_figure_footnote.get(i, float('inf')),
                     )
             for i in range(len(footnotes)):
@@ -163,7 +185,7 @@ class MagicModel:
                         continue
 
                     dis_table_footnote[i] = min(
-                        bbox_distance(tables[j]['bbox'], footnotes[i]['bbox']),
+                        self._bbox_distance(tables[j]['bbox'], footnotes[i]['bbox']),
                         dis_table_footnote.get(i, float('inf')),
                     )
             for i in range(len(footnotes)):
@@ -183,104 +205,25 @@ class MagicModel:
                     keep[i] = False
         return [bboxes[i] for i in range(N) if keep[i]]
 
-    def __tie_up_category_by_distance(
-        self, page_no, subject_category_id, object_category_id
+    def __tie_up_category_by_distance_v2(
+        self,
+        page_no: int,
+        subject_category_id: int,
+        object_category_id: int,
+        priority_pos: PosRelationEnum,
     ):
-        """假定每个 subject 最多有一个 object (可以有多个相邻的 object 合并为单个 object)，每个 object
-        只能属于一个 subject."""
-        ret = []
-        MAX_DIS_OF_POINT = 10**9 + 7
+        """_summary_
+
+        Args:
+            page_no (int): _description_
+            subject_category_id (int): _description_
+            object_category_id (int): _description_
+            priority_pos (PosRelationEnum): _description_
+
+        Returns:
+            _type_: _description_
         """
-        subject 和 object 的 bbox 会合并成一个大的 bbox （named: merged bbox）。
-        筛选出所有和 merged bbox 有 overlap 且 overlap 面积大于 object 的面积的 subjects。
-        再求出筛选出的 subjects 和 object 的最短距离
-        """
-        def search_overlap_between_boxes(
-            subject_idx, object_idx
-        ):
-            idxes = [subject_idx, object_idx]
-            x0s = [all_bboxes[idx]['bbox'][0] for idx in idxes]
-            y0s = [all_bboxes[idx]['bbox'][1] for idx in idxes]
-            x1s = [all_bboxes[idx]['bbox'][2] for idx in idxes]
-            y1s = [all_bboxes[idx]['bbox'][3] for idx in idxes]
-
-            merged_bbox = [
-                min(x0s),
-                min(y0s),
-                max(x1s),
-                max(y1s),
-            ]
-            ratio = 0
-
-            other_objects = list(
-                map(
-                    lambda x: {'bbox': x['bbox'], 'score': x['score']},
-                    filter(
-                        lambda x: x['category_id']
-                        not in (object_category_id, subject_category_id),
-                        self.__model_list[page_no]['layout_dets'],
-                    ),
-                )
-            )
-            for other_object in other_objects:
-                ratio = max(
-                    ratio,
-                    get_overlap_area(
-                        merged_bbox, other_object['bbox']
-                    ) * 1.0 / box_area(all_bboxes[object_idx]['bbox'])
-                )
-                if ratio >= MERGE_BOX_OVERLAP_AREA_RATIO:
-                    break
-
-            return ratio
-
-        def may_find_other_nearest_bbox(subject_idx, object_idx):
-            ret = float('inf')
-
-            x0 = min(
-                all_bboxes[subject_idx]['bbox'][0], all_bboxes[object_idx]['bbox'][0]
-            )
-            y0 = min(
-                all_bboxes[subject_idx]['bbox'][1], all_bboxes[object_idx]['bbox'][1]
-            )
-            x1 = max(
-                all_bboxes[subject_idx]['bbox'][2], all_bboxes[object_idx]['bbox'][2]
-            )
-            y1 = max(
-                all_bboxes[subject_idx]['bbox'][3], all_bboxes[object_idx]['bbox'][3]
-            )
-
-            object_area = abs(
-                all_bboxes[object_idx]['bbox'][2] - all_bboxes[object_idx]['bbox'][0]
-            ) * abs(
-                all_bboxes[object_idx]['bbox'][3] - all_bboxes[object_idx]['bbox'][1]
-            )
-
-            for i in range(len(all_bboxes)):
-                if (
-                    i == subject_idx
-                    or all_bboxes[i]['category_id'] != subject_category_id
-                ):
-                    continue
-                if _is_part_overlap([x0, y0, x1, y1], all_bboxes[i]['bbox']) or _is_in(
-                    all_bboxes[i]['bbox'], [x0, y0, x1, y1]
-                ):
-
-                    i_area = abs(
-                        all_bboxes[i]['bbox'][2] - all_bboxes[i]['bbox'][0]
-                    ) * abs(all_bboxes[i]['bbox'][3] - all_bboxes[i]['bbox'][1])
-                    if i_area >= object_area:
-                        ret = min(float('inf'), dis[i][object_idx])
-
-            return ret
-
-        def expand_bbbox(idxes):
-            x0s = [all_bboxes[idx]['bbox'][0] for idx in idxes]
-            y0s = [all_bboxes[idx]['bbox'][1] for idx in idxes]
-            x1s = [all_bboxes[idx]['bbox'][2] for idx in idxes]
-            y1s = [all_bboxes[idx]['bbox'][3] for idx in idxes]
-            return min(x0s), min(y0s), max(x1s), max(y1s)
-
+        AXIS_MULPLICITY = 0.5
         subjects = self.__reduct_overlap(
             list(
                 map(
@@ -304,315 +247,410 @@ class MagicModel:
                 )
             )
         )
-        subject_object_relation_map = {}
+        M = len(objects)
 
-        subjects.sort(
-            key=lambda x: x['bbox'][0] ** 2 + x['bbox'][1] ** 2
-        )  # get the distance !
+        subjects.sort(key=lambda x: x['bbox'][0] ** 2 + x['bbox'][1] ** 2)
+        objects.sort(key=lambda x: x['bbox'][0] ** 2 + x['bbox'][1] ** 2)
 
-        all_bboxes = []
+        sub_obj_map_h = {i: [] for i in range(len(subjects))}
 
-        for v in subjects:
-            all_bboxes.append(
+        dis_by_directions = {
+            'top': [[-1, float('inf')]] * M,
+            'bottom': [[-1, float('inf')]] * M,
+            'left': [[-1, float('inf')]] * M,
+            'right': [[-1, float('inf')]] * M,
+        }
+
+        for i, obj in enumerate(objects):
+            l_x_axis, l_y_axis = (
+                obj['bbox'][2] - obj['bbox'][0],
+                obj['bbox'][3] - obj['bbox'][1],
+            )
+            axis_unit = min(l_x_axis, l_y_axis)
+            for j, sub in enumerate(subjects):
+
+                bbox1, bbox2, _ = _remove_overlap_between_bbox(
+                    objects[i]['bbox'], subjects[j]['bbox']
+                )
+                left, right, bottom, top = bbox_relative_pos(bbox1, bbox2)
+                flags = [left, right, bottom, top]
+                if sum([1 if v else 0 for v in flags]) > 1:
+                    continue
+
+                if left:
+                    if dis_by_directions['left'][i][1] > bbox_distance(
+                        obj['bbox'], sub['bbox']
+                    ):
+                        dis_by_directions['left'][i] = [
+                            j,
+                            bbox_distance(obj['bbox'], sub['bbox']),
+                        ]
+                if right:
+                    if dis_by_directions['right'][i][1] > bbox_distance(
+                        obj['bbox'], sub['bbox']
+                    ):
+                        dis_by_directions['right'][i] = [
+                            j,
+                            bbox_distance(obj['bbox'], sub['bbox']),
+                        ]
+                if bottom:
+                    if dis_by_directions['bottom'][i][1] > bbox_distance(
+                        obj['bbox'], sub['bbox']
+                    ):
+                        dis_by_directions['bottom'][i] = [
+                            j,
+                            bbox_distance(obj['bbox'], sub['bbox']),
+                        ]
+                if top:
+                    if dis_by_directions['top'][i][1] > bbox_distance(
+                        obj['bbox'], sub['bbox']
+                    ):
+                        dis_by_directions['top'][i] = [
+                            j,
+                            bbox_distance(obj['bbox'], sub['bbox']),
+                        ]
+
+            if (
+                dis_by_directions['top'][i][1] != float('inf')
+                and dis_by_directions['bottom'][i][1] != float('inf')
+                and priority_pos in (PosRelationEnum.BOTTOM, PosRelationEnum.UP)
+            ):
+                RATIO = 3
+                if (
+                    abs(
+                        dis_by_directions['top'][i][1]
+                        - dis_by_directions['bottom'][i][1]
+                    )
+                    < RATIO * axis_unit
+                ):
+
+                    if priority_pos == PosRelationEnum.BOTTOM:
+                        sub_obj_map_h[dis_by_directions['bottom'][i][0]].append(i)
+                    else:
+                        sub_obj_map_h[dis_by_directions['top'][i][0]].append(i)
+                    continue
+
+            if dis_by_directions['left'][i][1] != float('inf') or dis_by_directions[
+                'right'
+            ][i][1] != float('inf'):
+                if dis_by_directions['left'][i][1] != float(
+                    'inf'
+                ) and dis_by_directions['right'][i][1] != float('inf'):
+                    if AXIS_MULPLICITY * axis_unit >= abs(
+                        dis_by_directions['left'][i][1]
+                        - dis_by_directions['right'][i][1]
+                    ):
+                        left_sub_bbox = subjects[dis_by_directions['left'][i][0]][
+                            'bbox'
+                        ]
+                        right_sub_bbox = subjects[dis_by_directions['right'][i][0]][
+                            'bbox'
+                        ]
+
+                        left_sub_bbox_y_axis = left_sub_bbox[3] - left_sub_bbox[1]
+                        right_sub_bbox_y_axis = right_sub_bbox[3] - right_sub_bbox[1]
+
+                        if (
+                            abs(left_sub_bbox_y_axis - l_y_axis)
+                            + dis_by_directions['left'][i][0]
+                            > abs(right_sub_bbox_y_axis - l_y_axis)
+                            + dis_by_directions['right'][i][0]
+                        ):
+                            left_or_right = dis_by_directions['right'][i]
+                        else:
+                            left_or_right = dis_by_directions['left'][i]
+                    else:
+                        left_or_right = dis_by_directions['left'][i]
+                        if left_or_right[1] > dis_by_directions['right'][i][1]:
+                            left_or_right = dis_by_directions['right'][i]
+                else:
+                    left_or_right = dis_by_directions['left'][i]
+                    if left_or_right[1] == float('inf'):
+                        left_or_right = dis_by_directions['right'][i]
+            else:
+                left_or_right = [-1, float('inf')]
+
+            if dis_by_directions['top'][i][1] != float('inf') or dis_by_directions[
+                'bottom'
+            ][i][1] != float('inf'):
+                if dis_by_directions['top'][i][1] != float('inf') and dis_by_directions[
+                    'bottom'
+                ][i][1] != float('inf'):
+                    if AXIS_MULPLICITY * axis_unit >= abs(
+                        dis_by_directions['top'][i][1]
+                        - dis_by_directions['bottom'][i][1]
+                    ):
+                        top_bottom = subjects[dis_by_directions['bottom'][i][0]]['bbox']
+                        bottom_top = subjects[dis_by_directions['top'][i][0]]['bbox']
+
+                        top_bottom_x_axis = top_bottom[2] - top_bottom[0]
+                        bottom_top_x_axis = bottom_top[2] - bottom_top[0]
+                        if (
+                            abs(top_bottom_x_axis - l_x_axis)
+                            + dis_by_directions['bottom'][i][1]
+                            > abs(bottom_top_x_axis - l_x_axis)
+                            + dis_by_directions['top'][i][1]
+                        ):
+                            top_or_bottom = dis_by_directions['top'][i]
+                        else:
+                            top_or_bottom = dis_by_directions['bottom'][i]
+                    else:
+                        top_or_bottom = dis_by_directions['top'][i]
+                        if top_or_bottom[1] > dis_by_directions['bottom'][i][1]:
+                            top_or_bottom = dis_by_directions['bottom'][i]
+                else:
+                    top_or_bottom = dis_by_directions['top'][i]
+                    if top_or_bottom[1] == float('inf'):
+                        top_or_bottom = dis_by_directions['bottom'][i]
+            else:
+                top_or_bottom = [-1, float('inf')]
+
+            if left_or_right[1] != float('inf') or top_or_bottom[1] != float('inf'):
+                if left_or_right[1] != float('inf') and top_or_bottom[1] != float(
+                    'inf'
+                ):
+                    if AXIS_MULPLICITY * axis_unit >= abs(
+                        left_or_right[1] - top_or_bottom[1]
+                    ):
+                        y_axis_bbox = subjects[left_or_right[0]]['bbox']
+                        x_axis_bbox = subjects[top_or_bottom[0]]['bbox']
+
+                        if (
+                            abs((x_axis_bbox[2] - x_axis_bbox[0]) - l_x_axis) / l_x_axis
+                            > abs((y_axis_bbox[3] - y_axis_bbox[1]) - l_y_axis)
+                            / l_y_axis
+                        ):
+                            sub_obj_map_h[left_or_right[0]].append(i)
+                        else:
+                            sub_obj_map_h[top_or_bottom[0]].append(i)
+                    else:
+                        if left_or_right[1] > top_or_bottom[1]:
+                            sub_obj_map_h[top_or_bottom[0]].append(i)
+                        else:
+                            sub_obj_map_h[left_or_right[0]].append(i)
+                else:
+                    if left_or_right[1] != float('inf'):
+                        sub_obj_map_h[left_or_right[0]].append(i)
+                    else:
+                        sub_obj_map_h[top_or_bottom[0]].append(i)
+        ret = []
+        for i in sub_obj_map_h.keys():
+            ret.append(
                 {
-                    'category_id': subject_category_id,
-                    'bbox': v['bbox'],
-                    'score': v['score'],
+                    'sub_bbox': {
+                        'bbox': subjects[i]['bbox'],
+                        'score': subjects[i]['score'],
+                    },
+                    'obj_bboxes': [
+                        {'score': objects[j]['score'], 'bbox': objects[j]['bbox']}
+                        for j in sub_obj_map_h[i]
+                    ],
+                    'sub_idx': i,
                 }
             )
+        return ret
 
-        for v in objects:
-            all_bboxes.append(
-                {
-                    'category_id': object_category_id,
-                    'bbox': v['bbox'],
-                    'score': v['score'],
-                }
+
+    def __tie_up_category_by_distance_v3(
+        self,
+        page_no: int,
+        subject_category_id: int,
+        object_category_id: int,
+        priority_pos: PosRelationEnum,
+    ):
+        subjects = self.__reduct_overlap(
+            list(
+                map(
+                    lambda x: {'bbox': x['bbox'], 'score': x['score']},
+                    filter(
+                        lambda x: x['category_id'] == subject_category_id,
+                        self.__model_list[page_no]['layout_dets'],
+                    ),
+                )
             )
-
-        N = len(all_bboxes)
-        dis = [[MAX_DIS_OF_POINT] * N for _ in range(N)]
-
-        for i in range(N):
-            for j in range(i):
-                if (
-                    all_bboxes[i]['category_id'] == subject_category_id
-                    and all_bboxes[j]['category_id'] == subject_category_id
-                ):
-                    continue
-
-                subject_idx, object_idx = i, j
-                if all_bboxes[j]['category_id'] == subject_category_id:
-                    subject_idx, object_idx = j, i
-
-                if search_overlap_between_boxes(subject_idx, object_idx) >= MERGE_BOX_OVERLAP_AREA_RATIO:
-                    dis[i][j] = float('inf')
-                    dis[j][i] = dis[i][j]
-                    continue
-
-                dis[i][j] = bbox_distance(all_bboxes[i]['bbox'], all_bboxes[j]['bbox'])
-                dis[j][i] = dis[i][j]
-
-        used = set()
-        for i in range(N):
-            # 求第 i 个 subject 所关联的 object
-            if all_bboxes[i]['category_id'] != subject_category_id:
-                continue
-            seen = set()
-            candidates = []
-            arr = []
-            for j in range(N):
-
-                pos_flag_count = sum(
-                    list(
-                        map(
-                            lambda x: 1 if x else 0,
-                            bbox_relative_pos(
-                                all_bboxes[i]['bbox'], all_bboxes[j]['bbox']
-                            ),
-                        )
-                    )
-                )
-                if pos_flag_count > 1:
-                    continue
-                if (
-                    all_bboxes[j]['category_id'] != object_category_id
-                    or j in used
-                    or dis[i][j] == MAX_DIS_OF_POINT
-                ):
-                    continue
-                left, right, _, _ = bbox_relative_pos(
-                    all_bboxes[i]['bbox'], all_bboxes[j]['bbox']
-                )  # 由  pos_flag_count 相关逻辑保证本段逻辑准确性
-                if left or right:
-                    one_way_dis = all_bboxes[i]['bbox'][2] - all_bboxes[i]['bbox'][0]
-                else:
-                    one_way_dis = all_bboxes[i]['bbox'][3] - all_bboxes[i]['bbox'][1]
-                if dis[i][j] > one_way_dis:
-                    continue
-                arr.append((dis[i][j], j))
-
-            arr.sort(key=lambda x: x[0])
-            if len(arr) > 0:
-                """
-                bug: 离该subject 最近的 object 可能跨越了其它的 subject。
-                比如 [this subect] [some sbuject] [the nearest object of subject]
-                """
-                if may_find_other_nearest_bbox(i, arr[0][1]) >= arr[0][0]:
-
-                    candidates.append(arr[0][1])
-                    seen.add(arr[0][1])
-
-            # 已经获取初始种子
-            for j in set(candidates):
-                tmp = []
-                for k in range(i + 1, N):
-                    pos_flag_count = sum(
-                        list(
-                            map(
-                                lambda x: 1 if x else 0,
-                                bbox_relative_pos(
-                                    all_bboxes[j]['bbox'], all_bboxes[k]['bbox']
-                                ),
-                            )
-                        )
-                    )
-
-                    if pos_flag_count > 1:
-                        continue
-
-                    if (
-                        all_bboxes[k]['category_id'] != object_category_id
-                        or k in used
-                        or k in seen
-                        or dis[j][k] == MAX_DIS_OF_POINT
-                        or dis[j][k] > dis[i][j]
-                    ):
-                        continue
-
-                    is_nearest = True
-                    for ni in range(i + 1, N):
-                        if ni in (j, k) or ni in used or ni in seen:
-                            continue
-
-                        if not float_gt(dis[ni][k], dis[j][k]):
-                            is_nearest = False
-                            break
-
-                    if is_nearest:
-                        nx0, ny0, nx1, ny1 = expand_bbbox(list(seen) + [k])
-                        n_dis = bbox_distance(
-                            all_bboxes[i]['bbox'], [nx0, ny0, nx1, ny1]
-                        )
-                        if float_gt(dis[i][j], n_dis):
-                            continue
-                        tmp.append(k)
-                        seen.add(k)
-
-                candidates = tmp
-                if len(candidates) == 0:
-                    break
-
-            # 已经获取到某个 figure 下所有的最靠近的 captions，以及最靠近这些 captions 的 captions 。
-            # 先扩一下 bbox，
-            ox0, oy0, ox1, oy1 = expand_bbbox(list(seen) + [i])
-            ix0, iy0, ix1, iy1 = all_bboxes[i]['bbox']
-
-            # 分成了 4 个截取空间，需要计算落在每个截取空间下 objects 合并后占据的矩形面积
-            caption_poses = [
-                [ox0, oy0, ix0, oy1],
-                [ox0, oy0, ox1, iy0],
-                [ox0, iy1, ox1, oy1],
-                [ix1, oy0, ox1, oy1],
-            ]
-
-            caption_areas = []
-            for bbox in caption_poses:
-                embed_arr = []
-                for idx in seen:
-                    if (
-                        calculate_overlap_area_in_bbox1_area_ratio(
-                            all_bboxes[idx]['bbox'], bbox
-                        )
-                        > CAPATION_OVERLAP_AREA_RATIO
-                    ):
-                        embed_arr.append(idx)
-
-                if len(embed_arr) > 0:
-                    embed_x0 = min([all_bboxes[idx]['bbox'][0] for idx in embed_arr])
-                    embed_y0 = min([all_bboxes[idx]['bbox'][1] for idx in embed_arr])
-                    embed_x1 = max([all_bboxes[idx]['bbox'][2] for idx in embed_arr])
-                    embed_y1 = max([all_bboxes[idx]['bbox'][3] for idx in embed_arr])
-                    caption_areas.append(
-                        int(abs(embed_x1 - embed_x0) * abs(embed_y1 - embed_y0))
-                    )
-                else:
-                    caption_areas.append(0)
-
-            subject_object_relation_map[i] = []
-            if max(caption_areas) > 0:
-                max_area_idx = caption_areas.index(max(caption_areas))
-                caption_bbox = caption_poses[max_area_idx]
-
-                for j in seen:
-                    if (
-                        calculate_overlap_area_in_bbox1_area_ratio(
-                            all_bboxes[j]['bbox'], caption_bbox
-                        )
-                        > CAPATION_OVERLAP_AREA_RATIO
-                    ):
-                        used.add(j)
-                        subject_object_relation_map[i].append(j)
-
-        for i in sorted(subject_object_relation_map.keys()):
-            result = {
-                'subject_body': all_bboxes[i]['bbox'],
-                'all': all_bboxes[i]['bbox'],
-                'score': all_bboxes[i]['score'],
-            }
-
-            if len(subject_object_relation_map[i]) > 0:
-                x0 = min(
-                    [all_bboxes[j]['bbox'][0] for j in subject_object_relation_map[i]]
-                )
-                y0 = min(
-                    [all_bboxes[j]['bbox'][1] for j in subject_object_relation_map[i]]
-                )
-                x1 = max(
-                    [all_bboxes[j]['bbox'][2] for j in subject_object_relation_map[i]]
-                )
-                y1 = max(
-                    [all_bboxes[j]['bbox'][3] for j in subject_object_relation_map[i]]
-                )
-                result['object_body'] = [x0, y0, x1, y1]
-                result['all'] = [
-                    min(x0, all_bboxes[i]['bbox'][0]),
-                    min(y0, all_bboxes[i]['bbox'][1]),
-                    max(x1, all_bboxes[i]['bbox'][2]),
-                    max(y1, all_bboxes[i]['bbox'][3]),
-                ]
-            ret.append(result)
-
-        total_subject_object_dis = 0
-        # 计算已经配对的 distance 距离
-        for i in subject_object_relation_map.keys():
-            for j in subject_object_relation_map[i]:
-                total_subject_object_dis += bbox_distance(
-                    all_bboxes[i]['bbox'], all_bboxes[j]['bbox']
-                )
-
-        # 计算未匹配的 subject 和 object 的距离（非精确版）
-        with_caption_subject = set(
-            [
-                key
-                for key in subject_object_relation_map.keys()
-                if len(subject_object_relation_map[i]) > 0
-            ]
         )
-        for i in range(N):
-            if all_bboxes[i]['category_id'] != object_category_id or i in used:
-                continue
-            candidates = []
-            for j in range(N):
-                if (
-                    all_bboxes[j]['category_id'] != subject_category_id
-                    or j in with_caption_subject
-                ):
-                    continue
-                candidates.append((dis[i][j], j))
-            if len(candidates) > 0:
-                candidates.sort(key=lambda x: x[0])
-                total_subject_object_dis += candidates[0][1]
-                with_caption_subject.add(j)
-        return ret, total_subject_object_dis
+        objects = self.__reduct_overlap(
+            list(
+                map(
+                    lambda x: {'bbox': x['bbox'], 'score': x['score']},
+                    filter(
+                        lambda x: x['category_id'] == object_category_id,
+                        self.__model_list[page_no]['layout_dets'],
+                    ),
+                )
+            )
+        )
 
-    def get_imgs(self, page_no: int):
-        with_captions, _ = self.__tie_up_category_by_distance(page_no, 3, 4)
-        with_footnotes, _ = self.__tie_up_category_by_distance(
-            page_no, 3, CategoryId.ImageFootnote
+        ret = []
+        N, M = len(subjects), len(objects)
+        subjects.sort(key=lambda x: x['bbox'][0] ** 2 + x['bbox'][1] ** 2)
+        objects.sort(key=lambda x: x['bbox'][0] ** 2 + x['bbox'][1] ** 2)
+
+        OBJ_IDX_OFFSET = 10000
+        SUB_BIT_KIND, OBJ_BIT_KIND = 0, 1
+
+        all_boxes_with_idx = [(i, SUB_BIT_KIND, sub['bbox'][0], sub['bbox'][1]) for i, sub in enumerate(subjects)] + [(i + OBJ_IDX_OFFSET , OBJ_BIT_KIND, obj['bbox'][0], obj['bbox'][1]) for i, obj in enumerate(objects)]
+        seen_idx = set()
+        seen_sub_idx = set()
+
+        while N > len(seen_sub_idx):
+            candidates = []
+            for idx, kind, x0, y0 in all_boxes_with_idx:
+                if idx in seen_idx:
+                    continue
+                candidates.append((idx, kind, x0, y0))
+
+            if len(candidates) == 0:
+                break
+            left_x = min([v[2] for v in candidates])
+            top_y =  min([v[3] for v in candidates])
+
+            candidates.sort(key=lambda x: (x[2]-left_x) ** 2 + (x[3] - top_y) ** 2)
+
+
+            fst_idx, fst_kind, left_x, top_y = candidates[0]
+            candidates.sort(key=lambda x: (x[2] - left_x) ** 2 + (x[3] - top_y)**2)
+            nxt = None
+
+            for i in range(1, len(candidates)):
+                if candidates[i][1] ^ fst_kind == 1:
+                    nxt = candidates[i]
+                    break
+            if nxt is None:
+                break
+
+            if fst_kind == SUB_BIT_KIND:
+                sub_idx, obj_idx = fst_idx, nxt[0] - OBJ_IDX_OFFSET
+
+            else:
+                sub_idx, obj_idx = nxt[0], fst_idx - OBJ_IDX_OFFSET
+
+            pair_dis = bbox_distance(subjects[sub_idx]['bbox'], objects[obj_idx]['bbox'])
+            nearest_dis = float('inf')
+            for i in range(N):
+                if i in seen_idx or i == sub_idx:continue
+                nearest_dis = min(nearest_dis, bbox_distance(subjects[i]['bbox'], objects[obj_idx]['bbox']))
+
+            if pair_dis >= 3*nearest_dis:
+                seen_idx.add(sub_idx)
+                continue
+
+            seen_idx.add(sub_idx)
+            seen_idx.add(obj_idx + OBJ_IDX_OFFSET)
+            seen_sub_idx.add(sub_idx)
+
+            ret.append(
+                {
+                    'sub_bbox': {
+                        'bbox': subjects[sub_idx]['bbox'],
+                        'score': subjects[sub_idx]['score'],
+                    },
+                    'obj_bboxes': [
+                        {'score': objects[obj_idx]['score'], 'bbox': objects[obj_idx]['bbox']}
+                    ],
+                    'sub_idx': sub_idx,
+                }
+            )
+
+        for i in range(len(objects)):
+            j = i + OBJ_IDX_OFFSET
+            if j in seen_idx:
+                continue
+            seen_idx.add(j)
+            nearest_dis, nearest_sub_idx = float('inf'), -1
+            for k in range(len(subjects)):
+                dis = bbox_distance(objects[i]['bbox'], subjects[k]['bbox'])
+                if dis < nearest_dis:
+                    nearest_dis = dis
+                    nearest_sub_idx = k
+
+            for k in range(len(subjects)):
+                if k != nearest_sub_idx: continue
+                if k in seen_sub_idx:
+                    for kk in range(len(ret)):
+                        if ret[kk]['sub_idx'] == k:
+                            ret[kk]['obj_bboxes'].append({'score': objects[i]['score'], 'bbox': objects[i]['bbox']})
+                            break
+                else:
+                    ret.append(
+                        {
+                            'sub_bbox': {
+                                'bbox': subjects[k]['bbox'],
+                                'score': subjects[k]['score'],
+                            },
+                            'obj_bboxes': [
+                                {'score': objects[i]['score'], 'bbox': objects[i]['bbox']}
+                            ],
+                            'sub_idx': k,
+                        }
+                    )
+                seen_sub_idx.add(k)
+                seen_idx.add(k)
+
+
+        for i in range(len(subjects)):
+            if i in seen_sub_idx:
+                continue
+            ret.append(
+                {
+                    'sub_bbox': {
+                        'bbox': subjects[i]['bbox'],
+                        'score': subjects[i]['score'],
+                    },
+                    'obj_bboxes': [],
+                    'sub_idx': i,
+                }
+            )
+
+
+        return ret
+
+
+    def get_imgs_v2(self, page_no: int):
+        with_captions = self.__tie_up_category_by_distance_v3(
+            page_no, 3, 4, PosRelationEnum.BOTTOM
+        )
+        with_footnotes = self.__tie_up_category_by_distance_v3(
+            page_no, 3, CategoryId.ImageFootnote, PosRelationEnum.ALL
         )
         ret = []
-        N, M = len(with_captions), len(with_footnotes)
-        assert N == M
-        for i in range(N):
+        for v in with_captions:
             record = {
-                'score': with_captions[i]['score'],
-                'img_caption_bbox': with_captions[i].get('object_body', None),
-                'img_body_bbox': with_captions[i]['subject_body'],
-                'img_footnote_bbox': with_footnotes[i].get('object_body', None),
+                'image_body': v['sub_bbox'],
+                'image_caption_list': v['obj_bboxes'],
             }
-
-            x0 = min(with_captions[i]['all'][0], with_footnotes[i]['all'][0])
-            y0 = min(with_captions[i]['all'][1], with_footnotes[i]['all'][1])
-            x1 = max(with_captions[i]['all'][2], with_footnotes[i]['all'][2])
-            y1 = max(with_captions[i]['all'][3], with_footnotes[i]['all'][3])
-            record['bbox'] = [x0, y0, x1, y1]
+            filter_idx = v['sub_idx']
+            d = next(filter(lambda x: x['sub_idx'] == filter_idx, with_footnotes))
+            record['image_footnote_list'] = d['obj_bboxes']
             ret.append(record)
         return ret
+
+    def get_tables_v2(self, page_no: int) -> list:
+        with_captions = self.__tie_up_category_by_distance_v3(
+            page_no, 5, 6, PosRelationEnum.UP
+        )
+        with_footnotes = self.__tie_up_category_by_distance_v3(
+            page_no, 5, 7, PosRelationEnum.ALL
+        )
+        ret = []
+        for v in with_captions:
+            record = {
+                'table_body': v['sub_bbox'],
+                'table_caption_list': v['obj_bboxes'],
+            }
+            filter_idx = v['sub_idx']
+            d = next(filter(lambda x: x['sub_idx'] == filter_idx, with_footnotes))
+            record['table_footnote_list'] = d['obj_bboxes']
+            ret.append(record)
+        return ret
+
+    def get_imgs(self, page_no: int):
+        return self.get_imgs_v2(page_no)
 
     def get_tables(
         self, page_no: int
     ) -> list:  # 3个坐标， caption, table主体，table-note
-        with_captions, _ = self.__tie_up_category_by_distance(page_no, 5, 6)
-        with_footnotes, _ = self.__tie_up_category_by_distance(page_no, 5, 7)
-        ret = []
-        N, M = len(with_captions), len(with_footnotes)
-        assert N == M
-        for i in range(N):
-            record = {
-                'score': with_captions[i]['score'],
-                'table_caption_bbox': with_captions[i].get('object_body', None),
-                'table_body_bbox': with_captions[i]['subject_body'],
-                'table_footnote_bbox': with_footnotes[i].get('object_body', None),
-            }
-
-            x0 = min(with_captions[i]['all'][0], with_footnotes[i]['all'][0])
-            y0 = min(with_captions[i]['all'][1], with_footnotes[i]['all'][1])
-            x1 = max(with_captions[i]['all'][2], with_footnotes[i]['all'][2])
-            y1 = max(with_captions[i]['all'][3], with_footnotes[i]['all'][3])
-            record['bbox'] = [x0, y0, x1, y1]
-            ret.append(record)
-        return ret
+        return self.get_tables_v2(page_no)
 
     def get_equations(self, page_no: int) -> list:  # 有坐标，也有字
         inline_equations = self.__get_blocks_by_type(
@@ -699,10 +737,10 @@ class MagicModel:
 
     def get_page_size(self, page_no: int):  # 获取页面宽高
         # 获取当前页的page对象
-        page = self.__docs[page_no]
+        page = self.__docs.get_page(page_no).get_page_info()
         # 获取当前页的宽高
-        page_w = page.rect.width
-        page_h = page.rect.height
+        page_w = page.w
+        page_h = page.h
         return page_w, page_h
 
     def __get_blocks_by_type(
@@ -731,30 +769,3 @@ class MagicModel:
 
     def get_model_list(self, page_no):
         return self.__model_list[page_no]
-
-
-if __name__ == '__main__':
-    drw = DiskReaderWriter(r'D:/project/20231108code-clean')
-    if 0:
-        pdf_file_path = r'linshixuqiu\19983-00.pdf'
-        model_file_path = r'linshixuqiu\19983-00_new.json'
-        pdf_bytes = drw.read(pdf_file_path, AbsReaderWriter.MODE_BIN)
-        model_json_txt = drw.read(model_file_path, AbsReaderWriter.MODE_TXT)
-        model_list = json.loads(model_json_txt)
-        write_path = r'D:\project\20231108code-clean\linshixuqiu\19983-00'
-        img_bucket_path = 'imgs'
-        img_writer = DiskReaderWriter(join_path(write_path, img_bucket_path))
-        pdf_docs = fitz.open('pdf', pdf_bytes)
-        magic_model = MagicModel(model_list, pdf_docs)
-
-    if 1:
-        model_list = json.loads(
-            drw.read('/opt/data/pdf/20240418/j.chroma.2009.03.042.json')
-        )
-        pdf_bytes = drw.read(
-            '/opt/data/pdf/20240418/j.chroma.2009.03.042.pdf', AbsReaderWriter.MODE_BIN
-        )
-        pdf_docs = fitz.open('pdf', pdf_bytes)
-        magic_model = MagicModel(model_list, pdf_docs)
-        for i in range(7):
-            print(magic_model.get_imgs(i))

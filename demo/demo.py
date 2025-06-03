@@ -1,38 +1,68 @@
+# Copyright (c) Opendatalab. All rights reserved.
 import os
-import json
 
-from loguru import logger
+from magic_pdf.data.data_reader_writer import FileBasedDataWriter, FileBasedDataReader
+from magic_pdf.data.dataset import PymuDocDataset
+from magic_pdf.model.doc_analyze_by_custom_model import doc_analyze
+from magic_pdf.config.enums import SupportedPdfParseMethod
 
-from magic_pdf.pipe.UNIPipe import UNIPipe
-from magic_pdf.rw.DiskReaderWriter import DiskReaderWriter
+# args
+__dir__ = os.path.dirname(os.path.abspath(__file__))
+pdf_file_name = os.path.join(__dir__, "pdfs", "demo1.pdf")  # replace with the real pdf path
+name_without_extension = os.path.basename(pdf_file_name).split('.')[0]
 
-import magic_pdf.model as model_config 
-model_config.__use_inside_model__ = True
+# prepare env
+local_image_dir = os.path.join(__dir__, "output", name_without_extension, "images")
+local_md_dir = os.path.join(__dir__, "output", name_without_extension)
+image_dir = str(os.path.basename(local_image_dir))
+os.makedirs(local_image_dir, exist_ok=True)
 
-try:
-    current_script_dir = os.path.dirname(os.path.abspath(__file__))
-    demo_name = "demo1"
-    pdf_path = os.path.join(current_script_dir, f"{demo_name}.pdf")
-    model_path = os.path.join(current_script_dir, f"{demo_name}.json")
-    pdf_bytes = open(pdf_path, "rb").read()
-    # model_json = json.loads(open(model_path, "r", encoding="utf-8").read())
-    model_json = []  # model_json传空list使用内置模型解析
-    jso_useful_key = {"_pdf_type": "", "model_list": model_json}
-    local_image_dir = os.path.join(current_script_dir, 'images')
-    image_dir = str(os.path.basename(local_image_dir))
-    image_writer = DiskReaderWriter(local_image_dir)
-    pipe = UNIPipe(pdf_bytes, jso_useful_key, image_writer)
-    pipe.pipe_classify()
-    """如果没有传入有效的模型数据，则使用内置model解析"""
-    if len(model_json) == 0:
-        if model_config.__use_inside_model__:
-            pipe.pipe_analyze()
-        else:
-            logger.error("need model list input")
-            exit(1)
-    pipe.pipe_parse()
-    md_content = pipe.pipe_mk_markdown(image_dir, drop_mode="none")
-    with open(f"{demo_name}.md", "w", encoding="utf-8") as f:
-        f.write(md_content)
-except Exception as e:
-    logger.exception(e)
+image_writer, md_writer = FileBasedDataWriter(local_image_dir), FileBasedDataWriter(local_md_dir)
+
+# read bytes
+reader1 = FileBasedDataReader("")
+pdf_bytes = reader1.read(pdf_file_name)  # read the pdf content
+
+# proc
+## Create Dataset Instance
+ds = PymuDocDataset(pdf_bytes)
+
+## inference
+if ds.classify() == SupportedPdfParseMethod.OCR:
+    infer_result = ds.apply(doc_analyze, ocr=True)
+
+    ## pipeline
+    pipe_result = infer_result.pipe_ocr_mode(image_writer)
+
+else:
+    infer_result = ds.apply(doc_analyze, ocr=False)
+
+    ## pipeline
+    pipe_result = infer_result.pipe_txt_mode(image_writer)
+
+### get model inference result
+model_inference_result = infer_result.get_infer_res()
+
+### draw layout result on each page
+pipe_result.draw_layout(os.path.join(local_md_dir, f"{name_without_extension}_layout.pdf"))
+
+### draw spans result on each page
+pipe_result.draw_span(os.path.join(local_md_dir, f"{name_without_extension}_spans.pdf"))
+
+### get markdown content
+md_content = pipe_result.get_markdown(image_dir)
+
+### dump markdown
+pipe_result.dump_md(md_writer, f"{name_without_extension}.md", image_dir)
+
+### get content list content
+content_list_content = pipe_result.get_content_list(image_dir)
+
+### dump content list
+pipe_result.dump_content_list(md_writer, f"{name_without_extension}_content_list.json", image_dir)
+
+### get middle json
+middle_json_content = pipe_result.get_middle_json()
+
+### dump middle json
+pipe_result.dump_middle_json(md_writer, f'{name_without_extension}_middle.json')
